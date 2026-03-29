@@ -126,7 +126,10 @@ but it does record the line number of each directive to support ordering validat
 A project-level catalogue:
 
 - For each source file: zero or more parcel declaration records, each with its export
-  path and the line numbers of both the pragma and the export include.
+  path and the line numbers of both the pragma and the export include. Multiple
+  declarations with the same parcel name are merged into a single record whose
+  identifier list is the cumulative union and whose export position is that of the
+  last pragma (see TRANSLATION.md _Cumulative parcel identifiers_).
 - A list of all import directives project-wide, keyed by `(namespace path, parcel
   name)` and stem.
 
@@ -163,7 +166,7 @@ A full C parser is not required. The parcelator uses a _targeted lexer_ approach
    sequence as a declaration using the grammar rules below.
 
 3. **Record** the result as a typed identifier record. If no declaration is found
-   for a listed identifier, record an _undefined exported identifier_ error (Stage 5).
+   for a listed identifier, record an _undefined identifier_ error (Stage 5).
 
 ### Declaration grammar (simplified)
 
@@ -297,22 +300,21 @@ The following diagnostics are emitted exactly as specified in
 
 | Condition | Detection point |
 |-----------|----------------|
-| Undefined exported identifier | Stage 2: identifier listed in pragma has no declaration in same file |
-| Orphan export include | Stage 1: export include present with no matching pragma in same file |
-
-| Import missing export | Stage 1: import include present with no corresponding export include for that name in any scanned file |
-| Canonical name collision | Stage 1: two distinct `(path, name)` pairs produce the same canonical prefix |
-| Stem collision | Stage 1: two import includes in the same file share a stem |
+| Undefined identifier | Stage 2: identifier listed in pragma has no declaration in same file |
+| Orphan export | Stage 1: export include present with no matching pragma in same file |
+| Undefined export | Stage 1: import include present with no corresponding export include for that name in any scanned file |
+| Path-name collision | Stage 1: two distinct `(path, name)` pairs produce the same canonical prefix |
+| Stem collision | Stage 1: two import includes in the same file apply the same stem |
 
 ### Warnings (generation proceeds)
 
 | Condition | Detection point |
 |-----------|----------------|
-| Parcel declaration without export | Stage 1: pragma present with no corresponding export include in same file |
-| Duplicate interface identifier | Stage 1/2: same identifier listed more than once in the same parcel |
+| Unexported parcel | Stage 1: pragma present with no corresponding export include in same file |
+| Duplicate interface identifier | Stage 1/2: same identifier listed more than once in the same parcel, including across cumulative same-name declarations |
 | Exported static identifier | Stage 2: exported identifier is declared `static` |
 | Canonical name conflict | Stage 4: a generated canonical name matches a user-defined identifier in the same file |
-| Unused import | Stage 1 + Stage 2: imported stem prefix never appears in the importing file |
+| Unused import | Stage 1 + Stage 2: import stem present but no corresponding stem-qualified identifiers appear in the file |
 
 All diagnostics report the source file path, line number, and a descriptive message.
 The exit code is non-zero if any errors were emitted.
@@ -534,7 +536,7 @@ error test suite:
 | Defect | Expected diagnostic |
 |--------|-------------------|
 | Export include before definitions | ordering error |
-| Missing `lib/` prefix in import/export paths | import missing export |
+| Missing `lib/` prefix in import/export paths | undefined export |
 | `IGetter` struct member named `put` instead of `get` | (no parcel error; C semantic issue only) |
 
 ### Regression suite
