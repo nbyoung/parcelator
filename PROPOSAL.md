@@ -152,75 +152,150 @@ record its type information.
 | `constant` | `const <T> <id> [ = <init> ] ;` or `<T> const <id> …` |
 | `function` | `<R> <f> ( <params> ) { … }` or `<R> <f> ( <params> ) ;` |
 
-### Parsing strategy
+### Shortcomings of the targeted-lexer approach
 
-A full C parser is not required. The parcelator uses a _targeted lexer_ approach:
+The original proposal described a _targeted lexer_ that tokenises the file and scans
+forward for any token matching an exported identifier name. This approach has two
+fundamental defects.
 
-1. **Tokenise** the source file into a flat token stream: identifiers, keywords,
-   punctuation, string literals, numeric literals, and comments (discarded). Block
-   contents (brace-delimited bodies) are consumed as opaque tokens — their internal
-   structure is not parsed.
+**Namespace confusion.** C defines four distinct namespaces in which the same spelling
+can denote unrelated things:
 
-2. **Scan forward** from the top of the token stream for any token matching one of
-   the exported identifier names. On a match, attempt to parse the surrounding token
-   sequence as a declaration using the grammar rules below.
+| Namespace | Examples |
+|-----------|---------|
+| Ordinary identifiers | typedefs, variables, constants, functions, enum constants |
+| Tags | `struct Foo`, `union Bar`, `enum Baz` tags |
+| Members | each struct/union has its own member namespace |
+| Labels | `goto` labels |
 
-3. **Record** the result as a typed identifier record. If no declaration is found
-   for a listed identifier, record an _undefined identifier_ error (Stage 5).
+A token scan cannot distinguish these. An exported identifier named `Foo` could be
+matched against `struct Foo { … }` (a tag), `union U { int Foo; }` (a member), or
+`Foo:` (a label) — none of which represent the ordinary-identifier declaration the
+parcelator must find. Conversely, a definition in the ordinary-identifier namespace
+might be preceded by a `struct Foo` tag bearing the same name, leading the scanner to
+stop at the wrong match. The consequence is that step 3 — reporting an _undefined
+identifier_ error when no declaration is found — is unreliable: the scanner may find
+a false positive (a non-declaring occurrence) and report no error when the real
+declaration is absent, or fail to recognise a valid declaration in an unanticipated
+syntactic form.
 
-### Declaration grammar (simplified)
+**Grammar incompleteness.** Real C codebases use type expressions of arbitrary
+complexity: function pointers returning pointers to arrays, `const`- and
+`volatile`-qualified pointers at multiple levels, K&R-style parameter lists, C11
+`_Alignas`/`_Atomic` qualifiers, compiler extension attributes (`__attribute__`,
+`__declspec`), anonymous struct/union members, flexible array members, and
+variable-length arrays. A small set of hard-coded grammar patterns cannot cover this
+space reliably, and any gap will silently produce incorrect type information or
+spurious _undefined identifier_ errors on conforming code.
 
-The parser recognises the following top-level declaration forms. All other
-constructs are skipped.
+### Alternative parsing schemes
 
-**Simple typedef**
-```
-typedef  <type-specifier>  <identifier>  ;
-```
-Type specifier: everything between `typedef` and the final `<identifier> ;`.
-Declarator identifier: last identifier before `;`.
+Three alternatives address both defects.
 
-**Pointer typedef**
-```
-typedef  <type-specifier>  * [ const ]  <identifier>  ;
-```
+#### Option A — Tree-sitter CST parser (recommended)
 
-**Function-pointer typedef**
-```
-typedef  <type-specifier>  ( * <identifier> )  ( <param-list> )  ;
-```
-The identifier is embedded between `(*` and `)`. The return type is the
-specifier preceding `(*`, expanded recursively if it contains typedef names.
+[Tree-sitter](https://tree-sitter.github.io/) is a battle-tested incremental parser
+generator. Its C grammar (`tree-sitter-c`) produces a full concrete syntax tree of a
+C source file without requiring preprocessing. Every node in the tree carries a named
+type (`type_definition`, `declaration`, `function_definition`, `struct_specifier`,
+`field_declaration`, `labeled_statement`, …) that directly encodes its syntactic role.
 
-**Struct typedef**
-```
-typedef  struct  { <member-list> }  <identifier>  ;
-```
-Member types are recorded but not fully expanded at this stage.
+Querying by node type eliminates namespace confusion entirely: a query for
+`(type_definition declarator: (type_identifier) @name)` matches only typedef
+declarators, never struct tags, member names, or labels. Type expressions are
+represented as structured subtrees rather than flat token sequences, so arbitrarily
+complex declarators are handled without additional grammar rules.
 
-**Variable declaration**
-```
-<type-specifier>  <identifier>  [ = <initialiser> ]  ;
-```
-`const` absent from the type specifier (after stripping leading `static`).
+Tree-sitter also:
+- tolerates incomplete or locally malformed code (error nodes are isolated);
+- parses `#pragma` directives as first-class CST nodes, allowing Stage 1 discovery
+  and Stage 2 declaration extraction to operate over the same tree in a single parse;
+- is available for both Python (`tree-sitter` ≥ 0.20, `tree-sitter-c` grammar) and
+  Rust (`tree-sitter` crate, `tree-sitter-c` crate).
 
-**Constant declaration**
-```
-const  <type-specifier>  <identifier>  [ = <initialiser> ]  ;
-```
-or `<type-specifier>  const  <identifier>  …`
+**Python**: install `tree-sitter` and the `tree-sitter-c` language package; query the
+CST using Tree-sitter's S-expression query syntax.
 
-**Function definition or prototype**
-```
-[ static ]  <return-type-specifier>  <identifier>  ( <param-list> )  ( ; | { … } )
-```
+**Rust**: add `tree-sitter` and `tree-sitter-c` as dependencies; traverse the tree
+using the `Node` API or pattern-match with queries.
 
-### Declarator reconstruction
+#### Option B — pycparser (Python only)
 
-For import file generation, the parcelator must be able to reconstruct the declarator
-with the exported identifier name replaced by a stem-prefixed form. The original
-declarator is stored verbatim alongside its identifier position, so that substitution
-can be applied without re-parsing.
+[pycparser](https://github.com/eliben/pycparser) is a pure-Python C99 parser that
+generates a typed AST whose node classes correspond directly to C grammar productions.
+Identifier kind and type are immediately readable from the AST without further
+pattern-matching.
+
+The critical limitation is that pycparser operates on _preprocessed_ source. It
+requires all `#include` files to be resolved and all macros to be expanded before
+parsing, and it does not accept `#pragma` directives. Because the parcelator is itself
+a pre-preprocessor step — generating the `_parcel/export/` and `_parcel/import/` files
+that the C preprocessor will later include — the parcel `#include` directives are
+unresolvable at the time parcelator runs. Workarounds (fake-libc stubs, manual
+directive stripping) add fragility and maintenance burden that outweigh pycparser's
+advantages over tree-sitter for this use case.
+
+#### Option C — libclang
+
+The Clang compiler exposes its full C/C++ AST through a stable C API (`libclang`),
+with Python bindings (`libclang` PyPI package, `clang.cindex`) and Rust bindings
+(`clang-sys`, `clang` crates). The AST is the most semantically complete
+representation available and is authoritative on all type-resolution edge cases.
+
+libclang shares pycparser's preprocessing requirement: it invokes the Clang
+preprocessor internally before parsing, which encounters the same unresolved include
+problem. Additionally, libclang requires a Clang installation as an external runtime
+dependency, which complicates distribution. It is best suited to a later phase when
+the project requires full semantic analysis (e.g., type-checking across translation
+units) rather than the syntactic extraction that Stage 2 needs.
+
+### Recommendation: Tree-sitter
+
+Tree-sitter is the appropriate choice for Stage 2 for the following reasons:
+
+1. **No preprocessing required.** It parses raw source files, side-stepping the
+   unresolvable-include problem entirely.
+2. **Namespace safety.** Typed CST nodes make it impossible to confuse ordinary
+   identifiers with tags, members, or labels.
+3. **Complete type expression coverage.** All syntactic forms representable in C,
+   including compiler extensions, are handled by the grammar rather than by
+   hand-written pattern rules.
+4. **Unified pass.** Stage 1 (discovery) and Stage 2 (declaration extraction) both
+   operate on the same CST produced by a single parse, eliminating redundant I/O.
+5. **Language continuity.** The same tree-sitter grammar and query interface is
+   available for both the Python prototype and the Rust production implementation.
+
+### Revised parsing design
+
+**Parse.** Pass each source file to the tree-sitter C parser, producing a CST. This
+replaces both the Stage 1 line scanner and the Stage 2 token-stream scanner.
+
+**Discover.** Walk the CST for `(preproc_pragma)` nodes matching the pattern
+`#pragma parcel <name> { … }` to obtain parcel declarations, and for
+`(preproc_include)` nodes to obtain export and import directives.
+
+**Classify.** For each identifier listed in a parcel declaration, query the CST for
+top-level declaration nodes in the ordinary-identifier namespace whose declared name
+matches:
+
+- `(type_definition … (type_identifier) @id)` → typedef
+- `(declaration … (init_declarator … (identifier) @id))` with `const` absent → variable
+- `(declaration … (init_declarator … (identifier) @id))` with `const` present → constant
+- `(function_definition … (function_declarator … (identifier) @id))` → function
+
+These queries are anchored to top-level declarations, automatically excluding struct
+tags (which appear inside `struct_specifier` nodes), member declarations (inside
+`field_declaration_list`), and labels (inside `labeled_statement`).
+
+**Record type information.** The type specifier and full declarator are read directly
+from the AST subtree. Because tree-sitter retains the source text for every node,
+the original source fragment can be extracted verbatim for use in type expansion
+(Stage 4) and declarator reconstruction (import file generation).
+
+**Undefined identifier detection.** A parcel identifier for which no top-level
+ordinary-identifier declaration exists in the file after exhausting all query patterns
+is recorded as an _undefined identifier_ error. This determination is now correct
+because the query scope is precisely the ordinary-identifier namespace.
 
 ---
 
