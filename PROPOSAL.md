@@ -103,9 +103,9 @@ Records: source file path, parcel name, ordered list of exported identifier name
 #include "export/<path>"
 ```
 
-Associates the most recently seen `#pragma parcel` in the same file with an export
-path. The trailing segment of the path is the parcel name; the leading segments are
-the namespace path. Records: canonical name (`<path_underscored>_<name>`).
+Associates all preceding `#pragma parcel <name>` statements in the same file whose `<name>` matches the
+trailing segment of `<path>` with that export path. The leading segments of `<path>` are the namespace
+path. Records: canonical name (`<path_underscored>_<name>`).
 
 **Import include**
 
